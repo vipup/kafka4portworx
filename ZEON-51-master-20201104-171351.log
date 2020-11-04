@@ -1,0 +1,922 @@
+Script started on Wed 04 Nov 2020 05:13:51 PM UTC
+]0;root@master: ~master $ watch kubectl get pods -n kube-system -l name=portworx -o wide
+[?1049h[1;32r(B[m[4l[?7h[H[2JEvery 2.0s: kubectl get pods -n kube-system -l name=portworx -o wide[1;133HWed Nov  4 17:14:01 2020[3;1HNAME[3;18HREADY     STATUS    RESTARTS   AGE[59GIP[3;73HNODE[4dportworx-2ct5q   1/1[28GRunning   0[4;49H6h[4;59H172.17.0.24   node02[5dportworx-b9h9r   1/1[28GRunning   0[5;49H6h[5;59H172.17.0.23   node01[6dportworx-r87gl   1/1[28GRunning   0[6;49H6h[6;59H172.17.0.25   node03[32;156H[1;151H3[32;156H[32;1H[?1049l[?1l>]0;root@master: ~master $ kubectl create -f px-ha-sc.yaml
+storageclass.storage.k8s.io/portworx-sc created
+storageclass.storage.k8s.io/portworx-sc-rep2 created
+]0;root@master: ~master $ cat px-ha-sc.yaml
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: portworx-sc
+provisioner: kubernetes.io/portworx-volume
+parameters:
+  repl: "1"
+  priority_io: "high"
+  group: "zk_vg"
+---
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: portworx-sc-rep2
+provisioner: kubernetes.io/portworx-volume
+parameters:
+  repl: "2"
+  priority_io: "high"
+  group: "kafka_vg"
+]0;root@master: ~master $ cat zk-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zk-config
+data:
+  ensemble: "zk-0;zk-1;zk-2"
+  jvm.heap: "512M"
+  tick: "2000"
+  init: "10"
+  sync: "5"
+  client.cnxns: "60"
+  snap.retain: "3"
+  purge.interval: "1"
+---
+apiVersion: policy/v1beta1
+kind: PodDisruptionBudget
+metadata:
+  name: zk-budget
+spec:
+  selector:
+    matchLabels:
+      app: zk
+  minAvailable: 2
+---  
+apiVersion: v1
+kind: Service
+metadata:
+  name: zk-headless
+  labels:
+    app: zk-headless
+spec:
+  ports:
+  - port: 2888
+    name: server
+  - port: 3888
+    name: leader-election
+  clusterIP: None
+  selector:
+    app: zk
+---
+]0;root@master: ~master $ kubectl create -f zk-config.yaml
+configmap/zk-config created
+poddisruptionbudget.policy/zk-budget created
+service/zk-headless created
+]0;root@master: ~master $ cat zk-ss.yaml
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: zk
+spec:
+  serviceName: zk-headless
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: zk
+      annotations:
+        pod.alpha.kubernetes.io/initialized: "true"
+    spec:
+      # Use the stork scheduler to enable more efficient placement of the pods
+      schedulerName: stork
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: px/running
+                operator: NotIn
+                values:
+                - "false"
+              - key: px/enabled
+                operator: NotIn
+                values:
+                - "false"
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: "app"
+                    operator: In
+                    values: 
+                    - zk-headless
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: k8szk
+        imagePullPolicy: Always
+        image: gcr.io/google_samples/k8szk:v1
+        ports:
+        - containerPort: 2181
+          name: client
+        - containerPort: 2888
+          name: server
+        - containerPort: 3888
+          name: leader-election
+        env:
+        - name : ZK_ENSEMBLE
+          valueFrom:
+            configMapKeyRef:
+              name: zk-config
+              key: ensemble
+        - name : ZK_HEAP_SIZE
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: jvm.heap
+        - name : ZK_TICK_TIME
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: tick
+        - name : ZK_INIT_LIMIT
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: init
+        - name : ZK_SYNC_LIMIT
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: tick
+        - name : ZK_MAX_CLIENT_CNXNS
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: client.cnxns
+        - name: ZK_SNAP_RETAIN_COUNT
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: snap.retain
+        - name: ZK_PURGE_INTERVAL
+          valueFrom:
+            configMapKeyRef:
+                name: zk-config
+                key: purge.interval
+        - name: ZK_CLIENT_PORT
+          value: "2181"
+        - name: ZK_SERVER_PORT
+          value: "2888"
+        - name: ZK_ELECTION_PORT
+          value: "3888"
+        command:
+        - sh
+        - -c
+        - zkGenConfig.sh && zkServer.sh start-foreground
+        readinessProbe:
+          exec:
+            command:
+            - "zkOk.sh"
+          initialDelaySeconds: 15
+          timeoutSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - "zkOk.sh"
+          initialDelaySeconds: 15
+          timeoutSeconds: 5
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/lib/zookeeper
+      securityContext:
+        runAsUser: 1000
+        fsGroup: 1000
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      storageClassName: portworx-sc
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 2Gi
+]0;root@master: ~master $ kubectl create -f zk-ss.yaml
+statefulset.apps/zk created
+]0;root@master: ~master $ watch kubectl get pods
+[?1049h[1;32r(B[m[4l[?7h[H[2JEvery 2.0s: kubectl get pods[1;133HWed Nov  4 17:14:38 2020[3;1HNAME[11GREADY     STATUS[3;41HRESTARTS   AGE[4dzk-0[11G0/1[21GContainerCreating   0[4;52H4s[32;156H[1;150H40[4;52H6[32;156H[1;151H2[4;52H9[32;156H[1;151H5[4;52H11s[32;156H[1;151H7[4;53H3[32;156H[1;151H9[4;53H5[32;156H[1;150H51[4;53H7[32;156H[1;151H3[4;52H20[32;156H[1;151H6[4;53H2[32;156H[1;151H8[4;53H4[32;156H[1;148H5:00[4;53H7[32;156H[1;151H3[4;53H9[32;156H[1;151H5[3;27H[10P[4;21HRunning   0          31s[K[32;156H[1;151H7[4;43H4[32;156H[1;150H10[4;43H6[32;156H[1;151H2[4;43H8[32;156H[1;151H4[4;42H40[32;156H[1;151H6[4;43H2[32;156H[1;151H8[4;43H5[32;156H[1;150H21[4;43H7[32;156H[1;151H3[4;43H9[32;156H[1;151H5[4;42H51[32;156H[1;151H7[4;11H1[4;43H3[5dzk-1[11G0/1[21GPending   0[5;42H0s[32;156H[1;151H9[4;43H6[5d3[32;156H[1;150H32[3;27H[14X[3;41HRESTARTS   AGE[4;31H [4;41H0   [52G58s[5;21HContainerCreating   0  [5;52H5s[32;156H[1;151H4[4;52H1m[K[5d7[32;156H[1;151H6[5;52H9[32;156H[1;151H8[5;52H11s[32;156H[1;150H40[5;53H3[32;156H[1;151H3[5;53H6[32;156H[1;151H5[5;53H8[32;156H[1;151H7[5;52H20[32;156H[1;151H9[5;53H2[32;156H[1;150H51[5;53H5[32;156H[1;151H4[5;53H7[32;156H[1;151H6[5;53H9[32;156H[1;151H8[3;27H[10P[4dg[10P[5;21HRunning   0          31s[K[32;156H[1;148H6:00[5;43H3[32;156H[1;151H2[5;43H6[32;156H[1;151H5[5;43H8[32;156H[1;151H7[5;42H40[32;156H[1;151H9[5;43H2[32;156H[1;150H11[5;43H4[32;156H[1;151H3[5;11H1[5;43H7[6dzk-2[11G0/1[21GPending   0[6;42H2s[32;156H[1;151H6[5;43H9[6d4[32;156H[1;151H8[5;42H51[6d6[32;156H[1;150H20[5;43H3[6d8[32;156H[1;151H2[5;43H5[6d10s[32;156H[1;151H4[5;43H8[6d3[32;156H[1;151H7[5;42H1m[K[6d5[32;156H[1;151H9[3;27H[14X[3;41HRESTARTS   AGE[4;28H    [4;41H0  [4;52H1m[5;28H    [5;41H0  [5;52H1m[6;21HContainerCreating   0   [52G17s[32;156H[1;150H31[6;53H9[32;156H[1;151H3[4;52H2[6d22[32;156H[1;151H6[6;53H4[32;156H[1;151H8[6;53H6[32;156H[1;150H40[6;53H8[32;156H[1;151H2[6;52H30[32;156H[1;151H4[6;53H3[32;156H[1;151H7[6;53H5[32;156H[1;151H9[6;53H7[32;156H[1;150H51[6;53H9[32;156H[1;151H3[3;27H[10P[4dg[10P[5d[10P[6;21HRunning   0          41s[K[32;156H[1;151H5[6;43H4[32;156H[1;151H8[6;43H6[32;156H[1;148H7:00[6;43H9[32;156H[1;151H3[6;42H51[32;156H[1;151H5[6;43H3[32;156H[1;151H7[6;43H5[32;156H[1;151H9[6;43H8[32;156H[1;150H12[6;42H1m[K[32;156H[1;151H4[32;156H[1;151H6[32;156H[1;151H8[6;11H1[32;156H[1;150H20[32;156H[1;151H3[32;156H[1;151H5[32;156H[1;151H7[5;42H2[32;156H[1;151H9[32;156H[32;1H[?1049l[?1l>]0;root@master: ~master $ kubectl exec zk-0 -- /opt/zookeeper/bin/zkCli.sh create /foo bar
+Connecting to localhost:2181
+2020-11-04 17:17:42,158 [myid:] - INFO  [main:Environment@100] - Client environment:zookeeper.version=3.4.9-1757313, built on 08/23/2016 06:50 GMT
+2020-11-04 17:17:42,162 [myid:] - INFO  [main:Environment@100] - Client environment:host.name=zk-0.zk-headless.default.svc.cluster.local
+2020-11-04 17:17:42,163 [myid:] - INFO  [main:Environment@100] - Client environment:java.version=1.8.0_111
+2020-11-04 17:17:42,167 [myid:] - INFO  [main:Environment@100] - Client environment:java.vendor=Oracle Corporation
+2020-11-04 17:17:42,168 [myid:] - INFO  [main:Environment@100] - Client environment:java.home=/usr/lib/jvm/java-8-openjdk-amd64/jre
+2020-11-04 17:17:42,168 [myid:] - INFO  [main:Environment@100] - Client environment:java.class.path=/opt/zookeeper/bin/../build/classes:/opt/zookeeper/bin/../build/lib/*.jar:/opt/zookeeper/bin/../lib/slf4j-log4j12-1.6.1.jar:/opt/zookeeper/bin/../lib/slf4j-api-1.6.1.jar:/opt/zookeeper/bin/../lib/netty-3.10.5.Final.jar:/opt/zookeeper/bin/../lib/log4j-1.2.16.jar:/opt/zookeeper/bin/../lib/jline-0.9.94.jar:/opt/zookeeper/bin/../zookeeper-3.4.9.jar:/opt/zookeeper/bin/../src/java/lib/*.jar:/opt/zookeeper/bin/../conf:
+2020-11-04 17:17:42,168 [myid:] - INFO  [main:Environment@100] - Client environment:java.library.path=/usr/java/packages/lib/amd64:/usr/lib/x86_64-linux-gnu/jni:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/jni:/lib:/usr/lib
+2020-11-04 17:17:42,168 [myid:] - INFO  [main:Environment@100] - Client environment:java.io.tmpdir=/tmp
+2020-11-04 17:17:42,169 [myid:] - INFO  [main:Environment@100] - Client environment:java.compiler=<NA>
+2020-11-04 17:17:42,169 [myid:] - INFO  [main:Environment@100] - Client environment:os.name=Linux
+2020-11-04 17:17:42,169 [myid:] - INFO  [main:Environment@100] - Client environment:os.arch=amd64
+2020-11-04 17:17:42,169 [myid:] - INFO  [main:Environment@100] - Client environment:os.version=4.4.0-62-generic
+2020-11-04 17:17:42,170 [myid:] - INFO  [main:Environment@100] - Client environment:user.name=zookeeper
+2020-11-04 17:17:42,170 [myid:] - INFO  [main:Environment@100] - Client environment:user.home=/home/zookeeper
+2020-11-04 17:17:42,170 [myid:] - INFO  [main:Environment@100] - Client environment:user.dir=/
+2020-11-04 17:17:42,172 [myid:] - INFO  [main:ZooKeeper@438] - Initiating client connection, connectString=localhost:2181 sessionTimeout=30000 watcher=org.apache.zookeeper.ZooKeeperMain$MyWatcher@1de0aca6
+2020-11-04 17:17:42,208 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@1032] - Opening socket connection to server localhost/0:0:0:0:0:0:0:1:2181. Will not attempt to authenticate using SASL (unknown error)
+2020-11-04 17:17:42,304 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@876] - Socket connection established to localhost/0:0:0:0:0:0:0:1:2181, initiating session
+2020-11-04 17:17:42,430 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@1299] - Session establishment complete on server localhost/0:0:0:0:0:0:0:1:2181, sessionid = 0x1759442751b0000, negotiated timeout = 30000
+
+WATCHER::
+
+WatchedEvent state:SyncConnected type:None path:null
+Created /foo
+]0;root@master: ~master $ kubectl exec zk-2 -- /opt/zookeeper/bin/zkCli.sh get /foo
+Connecting to localhost:2181
+2020-11-04 17:17:42,366 [myid:] - INFO  [main:Environment@100] - Client environment:zookeeper.version=3.4.9-1757313, built on 08/23/2016 06:50 GMT
+2020-11-04 17:17:42,370 [myid:] - INFO  [main:Environment@100] - Client environment:host.name=zk-2.zk-headless.default.svc.cluster.local
+2020-11-04 17:17:42,370 [myid:] - INFO  [main:Environment@100] - Client environment:java.version=1.8.0_111
+2020-11-04 17:17:42,373 [myid:] - INFO  [main:Environment@100] - Client environment:java.vendor=Oracle Corporation
+2020-11-04 17:17:42,373 [myid:] - INFO  [main:Environment@100] - Client environment:java.home=/usr/lib/jvm/java-8-openjdk-amd64/jre
+2020-11-04 17:17:42,373 [myid:] - INFO  [main:Environment@100] - Client environment:java.class.path=/opt/zookeeper/bin/../build/classes:/opt/zookeeper/bin/../build/lib/*.jar:/opt/zookeeper/bin/../lib/slf4j-log4j12-1.6.1.jar:/opt/zookeeper/bin/../lib/slf4j-api-1.6.1.jar:/opt/zookeeper/bin/../lib/netty-3.10.5.Final.jar:/opt/zookeeper/bin/../lib/log4j-1.2.16.jar:/opt/zookeeper/bin/../lib/jline-0.9.94.jar:/opt/zookeeper/bin/../zookeeper-3.4.9.jar:/opt/zookeeper/bin/../src/java/lib/*.jar:/opt/zookeeper/bin/../conf:
+2020-11-04 17:17:42,373 [myid:] - INFO  [main:Environment@100] - Client environment:java.library.path=/usr/java/packages/lib/amd64:/usr/lib/x86_64-linux-gnu/jni:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/usr/lib/jni:/lib:/usr/lib
+2020-11-04 17:17:42,374 [myid:] - INFO  [main:Environment@100] - Client environment:java.io.tmpdir=/tmp
+2020-11-04 17:17:42,374 [myid:] - INFO  [main:Environment@100] - Client environment:java.compiler=<NA>
+2020-11-04 17:17:42,374 [myid:] - INFO  [main:Environment@100] - Client environment:os.name=Linux
+2020-11-04 17:17:42,374 [myid:] - INFO  [main:Environment@100] - Client environment:os.arch=amd64
+2020-11-04 17:17:42,374 [myid:] - INFO  [main:Environment@100] - Client environment:os.version=4.4.0-62-generic
+2020-11-04 17:17:42,375 [myid:] - INFO  [main:Environment@100] - Client environment:user.name=zookeeper
+2020-11-04 17:17:42,375 [myid:] - INFO  [main:Environment@100] - Client environment:user.home=/home/zookeeper
+2020-11-04 17:17:42,375 [myid:] - INFO  [main:Environment@100] - Client environment:user.dir=/
+2020-11-04 17:17:42,378 [myid:] - INFO  [main:ZooKeeper@438] - Initiating client connection, connectString=localhost:2181 sessionTimeout=30000 watcher=org.apache.zookeeper.ZooKeeperMain$MyWatcher@1de0aca6
+2020-11-04 17:17:42,422 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@1032] - Opening socket connection to server localhost/127.0.0.1:2181. Will not attempt to authenticate using SASL (unknown error)
+2020-11-04 17:17:42,566 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@876] - Socket connection established to localhost/127.0.0.1:2181, initiating session
+2020-11-04 17:17:42,629 [myid:] - INFO  [main-SendThread(localhost:2181):ClientCnxn$SendThread@1299] - Session establishment complete on server localhost/127.0.0.1:2181, sessionid = 0x3759442fd120000, negotiated timeout = 30000
+
+WATCHER::
+
+WatchedEvent state:SyncConnected type:None path:null
+bar
+cZxid = 0x100000002
+ctime = Wed Nov 04 17:17:41 UTC 2020
+mZxid = 0x100000002
+mtime = Wed Nov 04 17:17:41 UTC 2020
+pZxid = 0x100000002
+cversion = 0
+dataVersion = 0
+aclVersion = 0
+ephemeralOwner = 0x0
+dataLength = 3
+numChildren = 0
+]0;root@master: ~master $ cat kafka-config.yaml
+
+---
+kind: ConfigMap
+metadata:
+  name: broker-config
+  namespace: default
+apiVersion: v1
+data:
+  init.sh: |-
+    #!/bin/bash
+    set -x
+
+    KAFKA_BROKER_ID=${HOSTNAME##*-}
+    cp -Lur /etc/kafka-configmap/* /etc/kafka/
+    sed -i "s/#init#broker.id=#init#/broker.id=$KAFKA_BROKER_ID/" /etc/kafka/server.properties
+
+    hash kubectl 2>/dev/null || {
+      sed -i "s/#init#broker.rack=#init#/#init#broker.rack=# kubectl not found in path/" /etc/kafka/server.properties
+    } && {
+      ZONE=$(kubectl get node "$NODE_NAME" -o=go-template='{{index .metadata.labels "failure-domain.beta.kubernetes.io/zone"}}')
+      if [ $? -ne 0 ]; then
+        sed -i "s/#init#broker.rack=#init#/#init#broker.rack=# zone lookup failed, see -c init-config logs/" /etc/kafka/server.properties
+      elif [ "x$ZONE" == "x<no value>" ]; then
+        sed -i "s/#init#broker.rack=#init#/#init#broker.rack=# zone label not found for node $NODE_NAME/" /etc/kafka/server.properties
+      else
+        sed -i "s/#init#broker.rack=#init#/broker.rack=$ZONE/" /etc/kafka/server.properties
+      fi
+    }
+
+  server.properties: |-
+    delete.topic.enable=true
+    num.network.threads=3
+    num.io.threads=8
+    socket.send.buffer.bytes=102400
+    socket.receive.buffer.bytes=102400
+    socket.request.max.bytes=104857600
+    log.dirs=/tmp/kafka-logs
+    num.partitions=1
+    num.recovery.threads.per.data.dir=1
+    offsets.topic.replication.factor=1
+    transaction.state.log.replication.factor=1
+    transaction.state.log.min.isr=1
+    log.retention.hours=168
+    log.segment.bytes=1073741824
+    log.retention.check.interval.ms=300000
+    zookeeper.connect=zk-0.zk-headless.default.svc.cluster.local:2181,zk-1.zk-headless.default.svc.cluster.local:2181,zk-2.zk-headless.default.svc.cluster.local:2181
+    zookeeper.connection.timeout.ms=6000
+    group.initial.rebalance.delay.ms=0
+
+  log4j.properties: |-
+    log4j.rootLogger=INFO, stdout
+
+    log4j.appender.stdout=org.apache.log4j.ConsoleAppender
+    log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
+    log4j.appender.stdout.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.kafkaAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.kafkaAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.kafkaAppender.File=${kafka.logs.dir}/server.log
+    log4j.appender.kafkaAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.kafkaAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.stateChangeAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.stateChangeAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.stateChangeAppender.File=${kafka.logs.dir}/state-change.log
+    log4j.appender.stateChangeAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.stateChangeAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.requestAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.requestAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.requestAppender.File=${kafka.logs.dir}/kafka-request.log
+    log4j.appender.requestAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.requestAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.cleanerAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.cleanerAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.cleanerAppender.File=${kafka.logs.dir}/log-cleaner.log
+    log4j.appender.cleanerAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.cleanerAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.controllerAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.controllerAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.controllerAppender.File=${kafka.logs.dir}/controller.log
+    log4j.appender.controllerAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.controllerAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    log4j.appender.authorizerAppender=org.apache.log4j.DailyRollingFileAppender
+    log4j.appender.authorizerAppender.DatePattern='.'yyyy-MM-dd-HH
+    log4j.appender.authorizerAppender.File=${kafka.logs.dir}/kafka-authorizer.log
+    log4j.appender.authorizerAppender.layout=org.apache.log4j.PatternLayout
+    log4j.appender.authorizerAppender.layout.ConversionPattern=[%d] %p %m (%c)%n
+
+    # Change the two lines below to adjust ZK client logging
+    log4j.logger.org.I0Itec.zkclient.ZkClient=INFO
+    log4j.logger.org.apache.zookeeper=INFO
+
+    # Change the two lines below to adjust the general broker logging level (output to server.log and stdout)
+    log4j.logger.kafka=INFO
+    log4j.logger.org.apache.kafka=INFO
+
+    # Change to DEBUG or TRACE to enable request logging
+    log4j.logger.kafka.request.logger=WARN, requestAppender
+    log4j.additivity.kafka.request.logger=false
+
+    log4j.logger.kafka.network.RequestChannel$=WARN, requestAppender
+    log4j.additivity.kafka.network.RequestChannel$=false
+
+    log4j.logger.kafka.controller=TRACE, controllerAppender
+    log4j.additivity.kafka.controller=false
+
+    log4j.logger.kafka.log.LogCleaner=INFO, cleanerAppender
+    log4j.additivity.kafka.log.LogCleaner=false
+
+    log4j.logger.state.change.logger=TRACE, stateChangeAppender
+    log4j.additivity.state.change.logger=false
+
+    log4j.logger.kafka.authorizer.logger=WARN, authorizerAppender
+    log4j.additivity.kafka.authorizer.logger=false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-broker
+  namespace: default
+spec:
+  ports:
+  - port: 9092
+  # [podname].broker.kafka.svc.cluster.local
+  clusterIP: None
+  selector:
+    app: kafka
+---
+]0;root@master: ~master $ kubectl create -f kafka-config.yaml
+configmap/broker-config created
+service/kafka-broker created
+]0;root@master: ~master $ cat kafka-ss.yaml
+apiVersion: apps/v1beta1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: default
+spec:
+  serviceName: "kafka-broker"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: kafka
+      annotations:
+    spec:
+      # Use the stork scheduler to enable more efficient placement of the pods
+      schedulerName: stork
+      terminationGracePeriodSeconds: 30
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: px/running
+                operator: NotIn
+                values:
+                - "false"
+              - key: px/enabled
+                operator: NotIn
+                values:
+                - "false"
+      initContainers:
+      - name: init-config
+        image: solsson/kafka-initutils@sha256:c275d681019a0d8f01295dbd4a5bae3cfa945c8d0f7f685ae1f00f2579f08c7d
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        command: ['/bin/bash', '/etc/kafka-configmap/init.sh']
+        volumeMounts:
+        - name: configmap
+          mountPath: /etc/kafka-configmap
+        - name: config
+          mountPath: /etc/kafka
+      containers:
+      - name: broker
+        image: solsson/kafka:0.11.0.0@sha256:b27560de08d30ebf96d12e74f80afcaca503ad4ca3103e63b1fd43a2e4c976ce
+        env:
+        - name: KAFKA_LOG4J_OPTS
+          value: -Dlog4j.configuration=file:/etc/kafka/log4j.properties
+        ports:
+        - containerPort: 9092
+        command:
+        - ./bin/kafka-server-start.sh
+        - /etc/kafka/server.properties
+        - --override
+        -   zookeeper.connect=zk-0.zk-headless.default.svc.cluster.local:2181,zk-1.zk-headless.default.svc.cluster.local:2181,zk-2.zk-headless.default.svc.cluster.local:2181
+        - --override
+        -   log.retention.hours=-1
+        - --override
+        -   log.dirs=/var/lib/kafka/data/topics
+        - --override
+        -   auto.create.topics.enable=false
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - 'echo "" | nc -w 1 127.0.0.1 9092'
+        volumeMounts:
+        - name: config
+          mountPath: /etc/kafka
+        - name: data
+          mountPath: /var/lib/kafka/data
+      volumes:
+      - name: configmap
+        configMap:
+          name: broker-config
+      - name: config
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: portworx-sc-rep2
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 3Gi
+]0;root@master: ~master $ cat kafka-cli.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-cli
+spec:
+  containers:
+  - name: kafka
+    image: solsson/kafka:0.11.0.0
+    command:
+      - sh
+      - -c
+      - "exec tail -f /dev/null"
+]0;root@master: ~master $ kubectl create -f kafka-ss.yaml
+statefulset.apps/kafka created
+]0;root@master: ~master $ kubectl create -f kafka-cli.yaml
+pod/kafka-cli created
+]0;root@master: ~master $ watch kubectl get pods
+[?1049h[1;32r(B[m[4l[?7h[H[2JEvery 2.0s: kubectl get pods[1;133HWed Nov  4 17:18:05 2020[3;1HNAME[3;13HREADY     STATUS    RESTARTS   AGE[4dkafka-0     0/1[23GPending   0[4;44H5s[5dkafka-cli   1/1[23GRunning   0[5;44H5s[6dzk-0[6;13H1/1[23GRunning   0[6;44H3m[7dzk-1[7;13H1/1[23GRunning   0[7;44H2m[8dzk-2[8;13H1/1[23GRunning   0[8;44H1m[32;156H[1;151H7[4;44H7[5d7[32;156H[1;151H9[3;29H     RESTARTS   AGE[4;23HInit:0/1   0[4;44H 10s[5;33H 0[5;44H 10s[6;30H    0[6;44H 3m[7;30H    0[7;44H 2m[8;30H    0[8;44H 1m[32;156H[1;150H12[4;46H2[5d2[8d2[32;156H[1;151H4[3;29H[1P[4;23HRunning   0 [4;44H14s[K[5;33H0 [5;44H14s[K[6;30H[1P[7d[1P[8d[1P[32;156H[1;151H6[4;45H6[5d6[32;156H[1;151H8[4;45H9[5d9[32;156H[1;150H21[4;44H21[5d21[32;156H[1;151H3[4;45H3[5d3[32;156H[1;151H5[4;45H5[5d5[32;156H[1;151H7[4;45H8[5d8[7d3[32;156H[1;150H30[4;13H1[4;44H30[5d30[32;156H[1;151H2[4;45H2[5d2[32;156H[32;1H[?1049l[?1l>]0;root@master: ~master $ 
+]0;root@master: ~master $ clear
+[3;J[H[2J]0;root@master: ~master $ kubectl exec -it kafka-cli bash
+root@kafka-cli:/opt/kafka# ./bin/kafka-topics.sh --create --zookeeper zk-headless:2181 --replication-factor 1 --partitions 1 --topic test
+Created topic "test".
+root@kafka-cli:/opt/kafka# ./bin/kafka-console-producer.sh --broker-list kafka-broker:9092 --topic test
+>>>asdf
+>t1t
+>t2
+>ttr
+>234
+>t234
+>t23
+>r2345
+>^C
+>Last message
+root@kafka-cli:/opt/kafka# ./bin/kafka-console-consumer.sh --bootstrap-server kafka-broker:9092 --topic test --partition 0 --from-beginning
+This is a message
+This is another message
+asdf
+t1t
+t2
+ttr
+234
+t234
+t23
+r2345
+
+^C
+clear
+exit
+^C./bin/kafka-console-producer.sh --broker-list kafka-broker:9092 --topic test
+This is a message
+This is another message
+Processed a total of 11 messages
+root@kafka-cli:/opt/kafka# ./bin/kafka-console-producer.sh --broker-list kafka-broker:9092 --topic test
+>>>exit
+>^Croot@kafka-cli:/opt/kafka# exit
+command terminated with exit code 130
+]0;root@master: ~master $ ps -afx
+  PID TTY      STAT   TIME COMMAND
+    2 ?        S      0:00 [kthreadd]
+    3 ?        S      0:02  \_ [ksoftirqd/0]
+    5 ?        S<     0:00  \_ [kworker/0:0H]
+    7 ?        R      1:54  \_ [rcu_sched]
+    8 ?        S      0:00  \_ [rcu_bh]
+    9 ?        S      0:00  \_ [migration/0]
+   10 ?        S      0:00  \_ [watchdog/0]
+   11 ?        S      0:00  \_ [watchdog/1]
+   12 ?        S      0:00  \_ [migration/1]
+   13 ?        S      0:27  \_ [ksoftirqd/1]
+   15 ?        S<     0:00  \_ [kworker/1:0H]
+   16 ?        S      0:00  \_ [watchdog/2]
+   17 ?        S      0:00  \_ [migration/2]
+   18 ?        S      0:01  \_ [ksoftirqd/2]
+   20 ?        S<     0:00  \_ [kworker/2:0H]
+   21 ?        S      0:00  \_ [watchdog/3]
+   22 ?        S      0:00  \_ [migration/3]
+   23 ?        S      0:01  \_ [ksoftirqd/3]
+   25 ?        S<     0:00  \_ [kworker/3:0H]
+   26 ?        S      0:00  \_ [kdevtmpfs]
+   27 ?        S<     0:00  \_ [netns]
+   28 ?        S<     0:00  \_ [perf]
+   29 ?        S      0:00  \_ [khungtaskd]
+   30 ?        S<     0:00  \_ [writeback]
+   31 ?        SN     0:00  \_ [ksmd]
+   32 ?        SN     0:28  \_ [khugepaged]
+   33 ?        S<     0:00  \_ [crypto]
+   34 ?        S<     0:00  \_ [kintegrityd]
+   35 ?        S<     0:00  \_ [bioset]
+   36 ?        S<     0:00  \_ [kblockd]
+   37 ?        S<     0:00  \_ [ata_sff]
+   38 ?        S<     0:00  \_ [md]
+   39 ?        S<     0:00  \_ [devfreq_wq]
+   44 ?        S      0:00  \_ [kswapd0]
+   45 ?        S<     0:00  \_ [vmstat]
+   46 ?        S      0:00  \_ [fsnotify_mark]
+   47 ?        S      0:00  \_ [ecryptfs-kthrea]
+   63 ?        S<     0:00  \_ [kthrotld]
+   64 ?        S<     0:00  \_ [acpi_thermal_pm]
+   65 ?        S<     0:00  \_ [bioset]
+   66 ?        S<     0:00  \_ [bioset]
+   67 ?        S<     0:00  \_ [bioset]
+   68 ?        S<     0:00  \_ [bioset]
+   69 ?        S<     0:00  \_ [bioset]
+   70 ?        S<     0:00  \_ [bioset]
+   71 ?        S<     0:00  \_ [bioset]
+   72 ?        S<     0:00  \_ [bioset]
+   73 ?        S<     0:00  \_ [bioset]
+   74 ?        S<     0:00  \_ [bioset]
+   75 ?        S<     0:00  \_ [bioset]
+   76 ?        S<     0:00  \_ [bioset]
+   77 ?        S<     0:00  \_ [bioset]
+   78 ?        S<     0:00  \_ [bioset]
+   79 ?        S<     0:00  \_ [bioset]
+   80 ?        S<     0:00  \_ [bioset]
+   81 ?        S<     0:00  \_ [bioset]
+   82 ?        S<     0:00  \_ [bioset]
+   83 ?        S<     0:00  \_ [bioset]
+   84 ?        S<     0:00  \_ [bioset]
+   85 ?        S<     0:00  \_ [bioset]
+   86 ?        S<     0:00  \_ [bioset]
+   87 ?        S<     0:00  \_ [bioset]
+   88 ?        S<     0:00  \_ [bioset]
+   89 ?        S<     0:00  \_ [bioset]
+   90 ?        S<     0:00  \_ [bioset]
+   91 ?        S      0:00  \_ [scsi_eh_0]
+   92 ?        S<     0:00  \_ [scsi_tmf_0]
+   93 ?        S      0:00  \_ [scsi_eh_1]
+   94 ?        S<     0:00  \_ [scsi_tmf_1]
+   99 ?        S<     0:00  \_ [ipv6_addrconf]
+  113 ?        S<     0:00  \_ [deferwq]
+  114 ?        S<     0:00  \_ [charger_manager]
+  116 ?        S<     0:00  \_ [bioset]
+  158 ?        S<     0:00  \_ [bioset]
+  159 ?        S<     0:00  \_ [bioset]
+  160 ?        S<     0:00  \_ [bioset]
+  161 ?        S<     0:00  \_ [bioset]
+  162 ?        S<     0:00  \_ [bioset]
+  163 ?        S<     0:00  \_ [bioset]
+  164 ?        S<     0:00  \_ [bioset]
+  165 ?        S<     0:00  \_ [bioset]
+  166 ?        S<     0:00  \_ [kpsmoused]
+  189 ?        S<     0:03  \_ [kworker/1:1H]
+  191 ?        S      0:06  \_ [jbd2/vda1-8]
+  192 ?        S<     0:00  \_ [ext4-rsv-conver]
+  220 ?        S<     0:03  \_ [kworker/0:1H]
+  254 ?        S      0:00  \_ [kauditd]
+  267 ?        S<     0:00  \_ [rpciod]
+  299 ?        S<     0:03  \_ [kworker/3:1H]
+  425 ?        S      1:20  \_ [hwrng]
+  533 ?        S<     0:00  \_ [kvm-irqfd-clean]
+  650 ?        S<     0:03  \_ [kworker/2:1H]
+30633 ?        S      0:00  \_ [kworker/1:3]
+  517 ?        S      0:00  \_ [kworker/1:0]
+ 1207 ?        S      0:00  \_ [kworker/3:4]
+ 1561 ?        S      0:00  \_ [kworker/2:0]
+ 2519 ?        S      0:00  \_ [kworker/u8:2]
+ 2817 ?        S      0:00  \_ [kworker/2:1]
+ 2818 ?        S      0:00  \_ [kworker/0:0]
+ 6359 ?        S      0:00  \_ [kworker/u8:0]
+ 6935 ?        S      0:00  \_ [kworker/0:2]
+ 7489 ?        S      0:00  \_ [kworker/3:1]
+ 8865 ?        S      0:00  \_ [kworker/1:1]
+ 9175 ?        S      0:00  \_ [kworker/u8:1]
+ 9305 ?        S      0:00  \_ [kworker/1:2]
+ 9782 ?        S      0:00  \_ [kworker/0:1]
+    1 ?        Ss     0:59 /sbin/init splash
+  239 ?        Ss     0:12 /lib/systemd/systemd-journald
+  285 ?        Ss     0:00 /lib/systemd/systemd-udevd
+  509 ?        Ss     0:04 /lib/systemd/systemd-logind
+  512 ?        Ss     0:22 /usr/bin/dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation
+  561 ?        Ssl    0:02 /usr/sbin/rsyslogd -n
+  575 ?        Ssl    0:02 /usr/lib/accountsservice/accounts-daemon
+  620 ?        Ss     0:00 /usr/sbin/cron -f
+  694 ?        Ss     0:00 /sbin/dhclient -1 -v -pf /run/dhclient.ens3.pid -lf /var/lib/dhcp/dhclient.ens3.leases -I -df /var/lib/dhcp/dhclient6.ens3.leases
+  717 ?        Ss     0:01 /usr/sbin/irqbalance --pid=/var/run/irqbalance.pid
+  900 ?        Ssl   13:55 /usr/bin/dockerd
+ 1781 ?        Ssl    1:58  \_ docker-containerd -l unix:///var/run/docker/libcontainerd/docker-containerd.sock --metrics-interval=0 --start-timeout 2m --st
+ 1801 ?        Sl     0:00      \_ docker-containerd-shim 261d0857c8614133f58694ffaa0a797d77f01c169f8e85342618627769e05841 /var/run/docker/libcontainerd/261
+ 1819 ?        Ssl   14:00      |   \_ etcd --advertise-client-urls=https://127.0.0.1:2379 --cert-file=/etc/kubernetes/pki/etcd/server.crt --client-cert-aut
+ 2086 ?        Sl     0:00      \_ docker-containerd-shim cb9e374237b53e1d23c7eb6a72d24b262a8ccc37b4230b231877e0ff6320201e /var/run/docker/libcontainerd/cb9
+ 2106 ?        Ss     0:00      |   \_ /pause
+ 2127 ?        Sl     0:00      \_ docker-containerd-shim d0efd7e77b2c2e595ed59db4a16eac5659a8fd18c44f201dd0c9d462de2e9175 /var/run/docker/libcontainerd/d0e
+ 2147 ?        Ssl    1:44      |   \_ /usr/local/bin/kube-proxy --config=/var/lib/kube-proxy/config.conf
+ 2244 ?        Sl     0:00      \_ docker-containerd-shim 2358f860b9ab0c70f59587088e03be5fc0cab2d315f98501ebfe132a0cf13732 /var/run/docker/libcontainerd/235
+ 2271 ?        Ss     0:00      |   \_ /pause
+ 2391 ?        Sl     0:00      \_ docker-containerd-shim d4505028cc08dd3e96d8b703af5d053222a3209a50566e50b2acabbbf0324970 /var/run/docker/libcontainerd/d45
+ 2411 ?        Ssl    3:39      |   \_ /usr/local/bin/etcd --data-dir=/etcd-data --name node1 --advertise-client-urls http://172.17.0.12:4001 --listen-clien
+ 2819 ?        Sl     0:01      \_ docker-containerd-shim d5ed85b2db3af6772cd710db3f280951f333f6d48f556a296536ead08c7d0559 /var/run/docker/libcontainerd/d5e
+ 2837 ?        Ss     0:00      |   \_ /bin/sh /home/weave/launch.sh
+ 2951 ?        Sl     1:08      |   |   \_ /home/weave/weaver --port=6783 --datapath=datapath --name=ce:d0:9e:37:f7:87 --host-root=/host --http-addr=127.0.0
+ 3355 ?        Sl     0:23      |   \_ /home/weave/kube-utils -run-reclaim-daemon -node-name=master -peer-name=ce:d0:9e:37:f7:87 -log-level=debug
+ 3401 ?        Sl     0:00      \_ docker-containerd-shim a321d4932c5a013a344fa0e82b197026b3665c78747fd5357730d9561bf8043d /var/run/docker/libcontainerd/a32
+ 3422 ?        Ssl    0:15      |   \_ /usr/bin/weave-npc
+ 3454 ?        S<     0:00      |       \_ /usr/sbin/ulogd -v
+ 3542 ?        Sl     0:00      \_ docker-containerd-shim 96beddfbfcd584061a67b3c5779c7e1cb5b5d60511abf82295cb5dcfd8e1d71c /var/run/docker/libcontainerd/96b
+ 3566 ?        Ss     0:00      |   \_ /pause
+ 3589 ?        Sl     0:00      \_ docker-containerd-shim a87e59c6ba158269614119f6ee44f226767055d98164fe3fe20f5287ec99e819 /var/run/docker/libcontainerd/a87
+ 3622 ?        Ss     0:00      |   \_ /pause
+ 3709 ?        Sl     0:00      \_ docker-containerd-shim 26c760422c71c7311a157044ccff303bb7f6249dec6e0f6583668c213fdc3029 /var/run/docker/libcontainerd/26c
+ 3791 ?        Ssl    1:15      |   \_ /coredns -conf /etc/coredns/Corefile
+ 3858 ?        Sl     0:01      \_ docker-containerd-shim 5525031ef0d50064c845fe247cfe0a6eec21b1b0b20b514535176c31d25dec06 /var/run/docker/libcontainerd/552
+ 3887 ?        Ssl    1:13          \_ /coredns -conf /etc/coredns/Corefile
+  921 tty1     Ss+    0:00 /sbin/agetty --noclear tty1 linux
+  922 ?        Ssl    0:04 /usr/sbin/ntpd -p /var/run/ntpd.pid -g -u 109:116
+  934 ?        Ss     0:01 /usr/sbin/sshd -D
+ 3017 ?        Ss     0:00  \_ sshd: root@pts/0
+ 3041 pts/0    Ss     0:00      \_ -bash
+ 6834 pts/0    S+     0:00          \_ script ZEON-51-master-20201104-171351.log
+ 6835 pts/1    Ss     0:00              \_ bash -i
+10198 pts/1    R+     0:00                  \_ ps -afx
+ 1393 ?        Ssl   19:01 /usr/bin/kubelet --bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf --config
+ 1482 ?        Sl     0:00 docker-containerd-shim d589c2e771a5a411eb78de7309803510a45eac2dbe426d6db6cac3cdfae3791d /var/run/docker/libcontainerd/d589c2e771a
+ 1517 ?        Ss     0:00  \_ /pause
+ 1496 ?        Sl     0:01 docker-containerd-shim 8caeacd6e02e0d19fe4e1fe5fbeadd661e9d5b35a6f1d1ccc51f16c7ceee26e5 /var/run/docker/libcontainerd/8caeacd6e02
+ 1548 ?        Ss     0:00  \_ /pause
+ 1502 ?        Sl     0:00 docker-containerd-shim 6e9d1f1ae64b250d096ffb57faaa346c1b053fc8480cb11d57788b80f9601d73 /var/run/docker/libcontainerd/6e9d1f1ae64
+ 1565 ?        Ss     0:00  \_ /pause
+ 1539 ?        Sl     0:00 docker-containerd-shim 230d99a1333e4a2802ed7c4d9a53674c0fd9d548c4789e36c51a61faa1d20823 /var/run/docker/libcontainerd/230d99a1333
+ 1579 ?        Ss     0:00  \_ /pause
+ 1637 ?        Sl     7:42 docker-containerd-shim 9f835b0d047b1978b660cdc58535bba2ae87041261314581caed42e77e907922 /var/run/docker/libcontainerd/9f835b0d047
+ 1657 ?        Ssl  156:12  \_ kube-apiserver --authorization-mode=Node,RBAC --advertise-address=172.17.0.12 --allow-privileged=true --client-ca-file=/etc/k
+ 1662 ?        Sl     0:00 docker-containerd-shim 0845c70a293ecf50563663b5cd30d34812fbec47ef6fc3232687624f9b600025 /var/run/docker/libcontainerd/0845c70a293
+ 1722 ?        Ssl    5:26  \_ kube-scheduler --address=127.0.0.1 --kubeconfig=/etc/kubernetes/scheduler.conf --leader-elect=true
+ 1681 ?        Sl     0:00 docker-containerd-shim 7556335d2196574bd1b8af8a3195d5592e230d9226822c2adf4c8942c15c4e32 /var/run/docker/libcontainerd/7556335d219
+ 1746 ?        Ssl    0:00  \_ /proc/self/exe init
+ 1691 ?        Sl     0:00 docker-containerd-shim 536032c006956754d8c85841f550ea012c9c1d22fbb9de3f52e241e2cd28e315 /var/run/docker/libcontainerd/536032c0069
+ 1716 ?        Ssl   22:37  \_ kube-controller-manager --address=127.0.0.1 --cluster-signing-cert-file=/etc/kubernetes/pki/ca.crt --cluster-signing-key-file
+ 3019 ?        Ss     0:00 /lib/systemd/systemd --user
+ 3020 ?        S      0:00  \_ (sd-pam)
+]0;root@master: ~master $ NODE=`kubectl get pods -o wide | grep kafka-0 | awk '{print $7}'`
+]0;root@master: ~master $ kubectl cordon ${NODE}
+node/node01 cordoned
+]0;root@master: ~master $ kubectl delete pod kafka-0
+pod "kafka-0" deleted
+]0;root@master: ~master $ watch kubectl get pods kafka-0 -o wide
+[?1049h[1;32r(B[m[4l[?7h[H[2JEvery 2.0s: kubectl get pods kafka-0 -o wide[1;133HWed Nov  4 17:21:07 2020[3;1HNAME[11GREADY     STATUS     RESTARTS   AGE[53GIP[3;63HNODE[4dkafka-0   0/1[21GInit:0/1   0[4;43H1s[4;53H<none>    node03[32;156H[1;151H9[3;55H[3;63H  NODE[4;43H3[4;53H10.44.0.6   node03[32;156H[1;150H11[3;27H[1P[4;21HRunning   0 [4;42H6[1P[32;156H[1;151H4[4;42H8[32;156H[1;151H6[4;42H10s[32;156H[1;151H8[4;43H2[32;156H[1;150H20[4;43H4[32;156H[1;151H2[4;11H1[4;43H7[32;156H[1;151H5[4;43H9[32;156H[32;1H[?1049l[?1l>]0;root@master: ~master $ 
+]0;root@master: ~master $ clear
+[3;J[H[2J]0;root@master: ~master $ kubectl uncordon ${NODE}
+node/node01 uncordoned
+]0;root@master: ~master $ kubectl exec -it kafka-cli bash
+root@kafka-cli:/opt/kafka# ./bin/kafka-console-consumer.sh --bootstrap-server kaffka-broker:9092 --topic test --partition 0 --from-beginning
+This is a message
+This is another message
+asdf
+t1t
+t2
+ttr
+234
+t234
+t23
+r2345
+
+This is a message
+This is another message
+exit
+^CProcessed a total of 14 messages
+root@kafka-cli:/opt/kafka# kubectl scale sts kafka --replicas=3
+bash: kubectl: command not found
+root@kafka-cli:/opt/kafka# exit
+command terminated with exit code 127
+]0;root@master: ~master $ kubectl scale sts kafka --replicas=3
+statefulset.apps/kafka scaled
+]0;root@master: ~master $ watch kubectl get pods
+[?1049h[1;32r(B[m[4l[?7h[H[2JEvery 2.0s: kubectl get pods[1;133HWed Nov  4 17:22:12 2020[3;1HNAME[3;13HREADY     STATUS     RESTARTS   AGE[4dkafka-0     1/1[23GRunning    0[4;45H1m[5dkafka-1     0/1[23GInit:0/1   0[5;45H4s[6dkafka-cli   1/1[23GRunning    0[6;45H4m[7dzk-0[7;13H1/1[23GRunning    0[7;45H7m[8dzk-1[8;13H1/1[23GRunning    0[8;45H6m[9dzk-2[9;13H1/1[23GRunning    0[9;45H6m[32;156H[1;151H4[5;45H6[32;156H[1;151H6[3;29H            RESTARTS   AGE[4;30H     [41G0          1m[5;23HPodInitializing   0          8s[6;30H     [41G0          4m[7;30H     [41G0          7m[8;30H     [41G0          6m[9;30H     [41G0          6m[32;156H[1;151H8[3;29H[8P[4dg[8P[5;23HRunning   0          10s[K[6;30H[8P[7d[8P[8d[8P[9d[8P[32;156H[1;150H20[5;45H2[32;156H[6d[L[1;151H2[5;13H1[5;45H5[6dkafka-2     0/1[23GPending   0[6;44H1s[32;156H[1;151H5[5;45H7[6d3[32;156H[1;151H7[5;45H9[6d5[9d7[32;156H[1;151H9[5;44H21[6d7[32;156H[1;150H31[3;29H     RESTARTS   AGE[4;30H    0[4;44H 1m[5;33H 0[5;44H 23s[6;23HInit:0/1   0[6;44H 9s[7;30H    0[7;44H 4m[8;30H    0[8;44H 7m[9;30H    0[9;44H 7m[10;30H    0[10;44H 6m[32;156H[1;151H3[3;29H            RESTARTS   AGE[4;30H     [41G0          1m[5;34H [41G0          26s[6;23HPodInitializing   0          12s[7;30H     [41G0          4m[8;34H [41G0          8m[9;30H     [41G0          7m[10;30H     [41G0          6m[32;156H[1;151H6[3;29H[8P[4dg[8P[5;33H0[41G   28s[K[6;23HRunning   0          14s[K[7;30H[8P[8d[8P[9d[8P[10d[8P[32;156H[1;151H8[5;44H30[6d6[32;156H[1;150H40[5;45H2[6;13H1[6;45H8[32;156H[1;151H2[5;45H4[6d20[32;156H[1;151H4[5;45H7[6d3[32;156H[1;151H7[5;45H9[6d5[32;156H[1;151H9[5;44H41[6d7[32;156H[32;1H[?1049l[?1l>]0;root@master: ~master $ 
+]0;root@master: ~master $ clear
+[3;J[H[2J]0;root@master: ~master $ VOL=`kubectl get pvc | grep kafka | awk '{print $3}'`
+]0;root@master: ~master $ PX_POD=$(kubectl get pods -l name=portworx -n kube-system -o jsonpath='{.items[0].metadata.name}')
+]0;root@master: ~master $ kubectl exec -it $PX_POD -n kube-system -- /opt/pwx/bin/pxctl volume inspect ${VOL}
+Volume	:  519239101214471856
+	Name            	 :  pvc-b0a6244d-1ec1-11eb-85d3-0242ac11000c
+	Group            	 :  kafka_vg
+	Size            	 :  3.0 GiB
+	Format          	 :  ext4
+	HA              	 :  2
+	IO Priority     	 :  HIGH
+	Creation time   	 :  Nov 4 17:18:01 UTC 2020
+	Shared          	 :  no
+	Status          	 :  [32mup[0m
+	State           	 :  Attached: e4761608-5850-4c5f-9cb0-1609a5b92b39 (172.17.0.25)
+	Device Path     	 :  /dev/pxd/pxd519239101214471856
+	Labels          	 :  namespace=default,pvc=data-kafka-0
+	Reads           	 :  88
+	Reads MS        	 :  120
+	Bytes Read      	 :  360448
+	Writes          	 :  103
+	Writes MS       	 :  7168
+	Bytes Written   	 :  1241088
+	IOs in progress 	 :  0
+	Bytes used      	 :  [32m2.9 MiB[0m
+	Replica sets on nodes:
+		Set 0
+		  Node 		 : 172.17.0.23 (Pool 0)
+		  Node 		 : 172.17.0.25 (Pool 0)
+	Replication Status	 :  [32mUp[0m
+	Volume consumers	 : 
+		- Name           : kafka-0 (1f96b17a-1ec2-11eb-85d3-0242ac11000c) (Pod)
+		  Namespace      : default
+		  Running on     : node03
+		  Controlled by  : kafka (StatefulSet)
+Volume	:  882345802934334599
+	Name            	 :  pvc-44aa21a5-1ec2-11eb-85d3-0242ac11000c
+	Group            	 :  kafka_vg
+	Size            	 :  3.0 GiB
+	Format          	 :  ext4
+	HA              	 :  2
+	IO Priority     	 :  HIGH
+	Creation time   	 :  Nov 4 17:22:10 UTC 2020
+	Shared          	 :  no
+	Status          	 :  [32mup[0m
+	State           	 :  Attached: f57f11a0-be42-43bf-8a05-afadef6371b7 (172.17.0.23)
+	Device Path     	 :  /dev/pxd/pxd882345802934334599
+	Labels          	 :  pvc=data-kafka-1,namespace=default
+	Reads           	 :  11
+	Reads MS        	 :  12
+	Bytes Read      	 :  45056
+	Writes          	 :  67
+	Writes MS       	 :  2568
+	Bytes Written   	 :  50511872
+	IOs in progress 	 :  0
+	Bytes used      	 :  [32m976 KiB[0m
+	Replica sets on nodes:
+		Set 0
+		  Node 		 : 172.17.0.24 (Pool 0)
+		  Node 		 : 172.17.0.23 (Pool 0)
+	Replication Status	 :  [32mUp[0m
+	Volume consumers	 : 
+		- Name           : kafka-1 (44ab48b9-1ec2-11eb-85d3-0242ac11000c) (Pod)
+		  Namespace      : default
+		  Running on     : node01
+		  Controlled by  : kafka (StatefulSet)
+Volume	:  111561912936835361
+	Name            	 :  pvc-4cfe7036-1ec2-11eb-85d3-0242ac11000c
+	Group            	 :  kafka_vg
+	Size            	 :  3.0 GiB
+	Format          	 :  ext4
+	HA              	 :  2
+	IO Priority     	 :  HIGH
+	Creation time   	 :  Nov 4 17:22:25 UTC 2020
+	Shared          	 :  no
+	Status          	 :  [32mup[0m
+	State           	 :  Attached: 04dfb20e-cbe7-4f8c-948f-df38d030f814 (172.17.0.24)
+	Device Path     	 :  /dev/pxd/pxd111561912936835361
+	Labels          	 :  namespace=default,pvc=data-kafka-2
+	Reads           	 :  11
+	Reads MS        	 :  4
+	Bytes Read      	 :  45056
+	Writes          	 :  55
+	Writes MS       	 :  1612
+	Bytes Written   	 :  44183552
+	IOs in progress 	 :  0
+	Bytes used      	 :  [32m976 KiB[0m
+	Replica sets on nodes:
+		Set 0
+		  Node 		 : 172.17.0.24 (Pool 0)
+		  Node 		 : 172.17.0.25 (Pool 0)
+	Replication Status	 :  [32mUp[0m
+	Volume consumers	 : 
+		- Name           : kafka-2 (4d002d4a-1ec2-11eb-85d3-0242ac11000c) (Pod)
+		  Namespace      : default
+		  Running on     : node02
+		  Controlled by  : kafka (StatefulSet)
+]0;root@master: ~master $ ^C
+]0;root@master: ~master $ ls -lag
+total 124
+drwx------  6 root  4096 Nov  4 17:13 [0m[01;34m.[0m
+drwxr-xr-x 22 root  4096 Mar 26  2019 [01;34m..[0m
+-rw-r--r--  1 root  3291 Apr 14  2019 .bashrc
+drwx------  2 root  4096 Nov  4 10:41 [01;34m.cache[0m
+-rw-r--r--  1 root     0 Apr 14  2019 .hushlogin
+-rw-r--r--  1 root     0 Nov  4 17:07 ingress.yaml
+-rwxr-xr-x  1 root   191 Nov  4 17:07 [01;32mkafka-cli.yaml[0m
+-rwxr-xr-x  1 root  5627 Nov  4 17:07 [01;32mkafka-config.yaml[0m
+-rwxr-xr-x  1 root  2746 Nov  4 17:07 [01;32mkafka-ss.yaml[0m
+drwxr-xr-x 18 root  4096 Nov  4 17:07 [01;34mkatacoda-scenarios-1[0m
+drwxr-xr-x  4 root  4096 Nov  4 10:43 [01;34m.kube[0m
+-rw-r--r--  1 root     0 Nov  4 17:07 out.log
+-rw-r--r--  1 root   148 Aug 17  2015 .profile
+-rwxr-xr-x  1 root   382 Nov  4 17:07 [01;32mpx-ha-sc.yaml[0m
+-rwxr-xr-x  1 root   273 Nov  4 17:07 [01;32mpx-snap.yaml[0m
+-rw-r--r--  1 root 13710 Nov  4 10:43 px-spec.yaml
+drwxr-xr-x  2 root  4096 Nov  4 17:07 [01;34m.ssh[0m
+-rw-r--r--  1 root 45056 Nov  4 17:22 ZEON-51-master-20201104-171351.log
+-rwxr-xr-x  1 root   597 Nov  4 17:07 [01;32mzk-config.yaml[0m
+-rwxr-xr-x  1 root  3446 Nov  4 17:07 [01;32mzk-ss.yaml[0m
+]0;root@master: ~master $ ls -lagh[K[Kh
+total 124K
+drwx------  6 root root 4.0K Nov  4 17:13 [0m[01;34m.[0m
+drwxr-xr-x 22 root root 4.0K Mar 26  2019 [01;34m..[0m
+-rw-r--r--  1 root root 3.3K Apr 14  2019 .bashrc
+drwx------  2 root root 4.0K Nov  4 10:41 [01;34m.cache[0m
+-rw-r--r--  1 root root    0 Apr 14  2019 .hushlogin
+-rw-r--r--  1 root root    0 Nov  4 17:07 ingress.yaml
+-rwxr-xr-x  1 root root  191 Nov  4 17:07 [01;32mkafka-cli.yaml[0m
+-rwxr-xr-x  1 root root 5.5K Nov  4 17:07 [01;32mkafka-config.yaml[0m
+-rwxr-xr-x  1 root root 2.7K Nov  4 17:07 [01;32mkafka-ss.yaml[0m
+drwxr-xr-x 18 root root 4.0K Nov  4 17:07 [01;34mkatacoda-scenarios-1[0m
+drwxr-xr-x  4 root root 4.0K Nov  4 10:43 [01;34m.kube[0m
+-rw-r--r--  1 root root    0 Nov  4 17:07 out.log
+-rw-r--r--  1 root root  148 Aug 17  2015 .profile
+-rwxr-xr-x  1 root root  382 Nov  4 17:07 [01;32mpx-ha-sc.yaml[0m
+-rwxr-xr-x  1 root root  273 Nov  4 17:07 [01;32mpx-snap.yaml[0m
+-rw-r--r--  1 root root  14K Nov  4 10:43 px-spec.yaml
+drwxr-xr-x  2 root root 4.0K Nov  4 17:07 [01;34m.ssh[0m
+-rw-r--r--  1 root root  44K Nov  4 17:22 ZEON-51-master-20201104-171351.log
+-rwxr-xr-x  1 root root  597 Nov  4 17:07 [01;32mzk-config.yaml[0m
+-rwxr-xr-x  1 root root 3.4K Nov  4 17:07 [01;32mzk-ss.yaml[0m
+]0;root@master: ~master $ date
+Wed Nov  4 17:23:26 UTC 2020
+]0;root@master: ~master $ datels -lah
+total 124K
+drwx------  6 root root 4.0K Nov  4 17:13 [0m[01;34m.[0m
+drwxr-xr-x 22 root root 4.0K Mar 26  2019 [01;34m..[0m
+-rw-r--r--  1 root root 3.3K Apr 14  2019 .bashrc
+drwx------  2 root root 4.0K Nov  4 10:41 [01;34m.cache[0m
+-rw-r--r--  1 root root    0 Apr 14  2019 .hushlogin
+-rw-r--r--  1 root root    0 Nov  4 17:07 ingress.yaml
+-rwxr-xr-x  1 root root  191 Nov  4 17:07 [01;32mkafka-cli.yaml[0m
+-rwxr-xr-x  1 root root 5.5K Nov  4 17:07 [01;32mkafka-config.yaml[0m
+-rwxr-xr-x  1 root root 2.7K Nov  4 17:07 [01;32mkafka-ss.yaml[0m
+drwxr-xr-x 18 root root 4.0K Nov  4 17:07 [01;34mkatacoda-scenarios-1[0m
+drwxr-xr-x  4 root root 4.0K Nov  4 10:43 [01;34m.kube[0m
+-rw-r--r--  1 root root    0 Nov  4 17:07 out.log
+-rw-r--r--  1 root root  148 Aug 17  2015 .profile
+-rwxr-xr-x  1 root root  382 Nov  4 17:07 [01;32mpx-ha-sc.yaml[0m
+-rwxr-xr-x  1 root root  273 Nov  4 17:07 [01;32mpx-snap.yaml[0m
+-rw-r--r--  1 root root  14K Nov  4 10:43 px-spec.yaml
+drwxr-xr-x  2 root root 4.0
